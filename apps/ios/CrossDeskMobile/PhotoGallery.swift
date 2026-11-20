@@ -329,3 +329,75 @@ struct PhotoGalleryView: View {
         .padding(.vertical, 8)
     }
 }
+
+/// Files the host pushed to this device. The bridge writes them into
+/// Documents/Received and the folder is visible in the Files app, so this sheet
+/// is a shortcut: list, share, or hand off to another app.
+struct ReceivedFilesView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var files: [URL] = []
+
+    var body: some View {
+        NavigationStack {
+            List(files, id: \.self) { url in
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(url.lastPathComponent).font(.body).lineLimit(1)
+                        Text(ReceivedFilesView.describe(url))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    ShareLink(item: url) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                }
+            }
+            .overlay {
+                if files.isEmpty {
+                    VStack(spacing: 6) {
+                        Text("还没有接收到的文件").font(.footnote).foregroundStyle(.secondary)
+                        Text("远端发来的文件会出现在这里").font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            .navigationTitle("接收的文件")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { dismiss() }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("刷新") { reload() }
+                }
+            }
+            .task { reload() }
+        }
+    }
+
+    private static var directory: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Received", isDirectory: true)
+    }
+
+    private func reload() {
+        let manager = FileManager.default
+        let entries = (try? manager.contentsOfDirectory(
+            at: ReceivedFilesView.directory,
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles])) ?? []
+        files = entries.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private static func describe(_ url: URL) -> String {
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let size = ByteCountFormatter.string(
+            fromByteCount: Int64(values?.fileSize ?? 0), countStyle: .file)
+        if let date = values?.contentModificationDate {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "MM-dd HH:mm"
+            return "\(size) · \(formatter.string(from: date))"
+        }
+        return size
+    }
+}

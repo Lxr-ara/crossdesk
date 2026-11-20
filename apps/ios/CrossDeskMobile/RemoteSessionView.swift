@@ -60,6 +60,7 @@ struct RemoteSessionView: View {
     @State private var cursorPosition: CGPoint?
     @State private var statusMenuVisible = false
     @State private var showingPhotoGallery = false
+    @State private var showingReceivedFiles = false
     @State private var statusOrbCenter: CGPoint?
     @GestureState private var statusOrbDragTranslation = CGSize.zero
 
@@ -398,31 +399,17 @@ struct RemoteSessionView: View {
         .ignoresSafeArea()
     }
 
-    /// Album entry: a small capsule opposite the status orb so touch targets do
-    /// not overlap the mouse pad or the floating menu.
+    /// Sheets only: the album and the received-files list are opened from the
+    /// floating menu, so this carrier draws nothing.
     private var photoGalleryLauncher: some View {
-        VStack {
-            Spacer()
-            HStack {
-                Button {
-                    mouseInput.releaseAll()
-                    showingPhotoGallery = true
-                } label: {
-                    Label("照片", systemImage: "photo.on.rectangle.angled")
-                        .font(.footnote.weight(.semibold))
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 9)
-                        .background(.ultraThinMaterial, in: Capsule())
-                }
-                .buttonStyle(.plain)
-                .padding(.leading, 16)
-                .padding(.bottom, 96)
-                Spacer()
+        Color.clear
+            .frame(width: 0, height: 0)
+            .sheet(isPresented: $showingPhotoGallery) {
+                PhotoGalleryView(store: session.photoGallery)
             }
-        }
-        .sheet(isPresented: $showingPhotoGallery) {
-            PhotoGalleryView(store: session.photoGallery)
-        }
+            .sheet(isPresented: $showingReceivedFiles) {
+                ReceivedFilesView()
+            }
     }
 
     private var floatingStatusControls: some View {
@@ -476,6 +463,16 @@ struct RemoteSessionView: View {
                                 statusMenuVisible = false
                                 keyboardInputVisible = false
                                 showingFileImporter = true
+                            },
+                            showPhotoAlbum: {
+                                statusMenuVisible = false
+                                keyboardInputVisible = false
+                                showingPhotoGallery = true
+                            },
+                            showReceivedFiles: {
+                                statusMenuVisible = false
+                                keyboardInputVisible = false
+                                showingReceivedFiles = true
                             },
                             close: {
                                 withAnimation(.easeOut(duration: 0.14)) {
@@ -1172,6 +1169,8 @@ private struct FloatingSessionMenu: View {
     @State private var displayedFrameSize: CGSize
     let showKeyboard: () -> Void
     let chooseFile: () -> Void
+    let showPhotoAlbum: () -> Void
+    let showReceivedFiles: () -> Void
     let close: () -> Void
     let disconnect: () -> Void
 
@@ -1187,6 +1186,8 @@ private struct FloatingSessionMenu: View {
          releaseMouse: @escaping () -> Void,
          showKeyboard: @escaping () -> Void,
          chooseFile: @escaping () -> Void,
+         showPhotoAlbum: @escaping () -> Void,
+         showReceivedFiles: @escaping () -> Void,
          close: @escaping () -> Void,
          disconnect: @escaping () -> Void) {
         self.session = session
@@ -1196,6 +1197,8 @@ private struct FloatingSessionMenu: View {
         self.releaseMouse = releaseMouse
         self.showKeyboard = showKeyboard
         self.chooseFile = chooseFile
+        self.showPhotoAlbum = showPhotoAlbum
+        self.showReceivedFiles = showReceivedFiles
         self.close = close
         self.disconnect = disconnect
         // Render the first frame with real values instead of replacing empty
@@ -1337,6 +1340,12 @@ private struct FloatingSessionMenu: View {
                     FloatingControlButton(title: NSLocalizedString("发送文件", comment: ""),
                                           symbol: "folder.badge.plus",
                                           action: chooseFile)
+                    FloatingControlButton(title: NSLocalizedString("照片", comment: ""),
+                                          symbol: "photo.on.rectangle.angled",
+                                          action: showPhotoAlbum)
+                    FloatingControlButton(title: NSLocalizedString("接收的文件", comment: ""),
+                                          symbol: "tray.and.arrow.down",
+                                          action: showReceivedFiles)
                     FloatingControlButton(title: NSLocalizedString("网络状态", comment: ""), symbol: "chart.bar.xaxis") {
                         page = .networkStats
                     }
@@ -1689,46 +1698,42 @@ private struct RemoteCursorGlyph: View {
     let shape: Int
 
     var body: some View {
-        Group {
-            if shape == 0 {
-                ZStack {
-                    RemoteCursorArrowShape()
-                        .stroke(Color.black, lineWidth: 1.75)
-                    RemoteCursorArrowShape()
-                        .fill(Color.white)
-                }
-                .frame(width: 12, height: 15)
-            } else if shape == 7 {
-                ZStack {
-                    RemoteIBeamShape()
-                        .stroke(Color.black, lineWidth: 2.5)
-                    RemoteIBeamShape()
-                        .stroke(Color.white, lineWidth: 1)
-                }
-                .frame(width: 12, height: 15)
-            } else {
-                Image(systemName: availableSymbolName)
-                    .font(.system(size: 10.5, weight: .black))
-                    .symbolRenderingMode(.monochrome)
-                    .foregroundStyle(.white)
-                    .shadow(color: .black, radius: 0.75)
-            }
+        // UU remote cursor art: the desktop controller draws the same assets, so
+        // the phone shows exactly the pointer the user sees on the host.
+        Image(RemoteCursorGlyph.assetName(for: shape))
+            .resizable()
+            .interpolation(.high)
+            .scaledToFit()
+            .frame(width: RemoteCursorGlyph.size, height: RemoteCursorGlyph.size)
+            .accessibilityHidden(true)
+    }
+
+    static let size: CGFloat = 26
+
+    static func assetName(for shape: Int) -> String {
+        switch shape {
+        case 2: return "uu_text"
+        case 3: return "uu_hand"
+        case 4: return "uu_grab"
+        case 5: return "uu_move"
+        case 6: return "uu_wait"
+        case 7: return "uu_help"
+        case 8: return "uu_crosshair"
+        case 9: return "uu_copy"
+        case 16, 25: return "uu_resize_ew"
+        case 17, 26: return "uu_resize_ns"
+        case 18, 21: return "uu_resize_nesw"
+        case 19, 20: return "uu_resize_nwse"
+        case 11, 12, 13, 14, 15: return "uu_disabled"
+        default: return "uu_arrow"
         }
-        .frame(width: 15, height: 15)
-        .accessibilityHidden(true)
     }
 
     static func hotspotOffset(for shape: Int) -> CGPoint {
-        switch shape {
-        case 0:
-            // The arrow path's visual tip is near (2.5, 0.6) inside its
-            // 15-point container, rather than at the container origin.
-            return CGPoint(x: 5, y: 7)
-        case 3:
-            return CGPoint(x: 4.5, y: 4.5)
-        default:
-            return .zero
-        }
+        // The art is a 64 px tile whose hotspot sits at (4, 4); scaled to the
+        // 26 pt glyph that is ~1.6 pt, so the tip lands under the finger.
+        _ = shape
+        return CGPoint(x: size / 2 - 0.5, y: size / 2 - 0.5)
     }
 
     private var availableSymbolName: String {
