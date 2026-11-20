@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 import UIKit
 
@@ -33,6 +34,8 @@ final class PhotoGalleryStore: ObservableObject {
 
     /// Filled by RemoteSessionModel with the bridge transport.
     var sendMessage: ((Data) -> Void)?
+    /// Phone -> host uploads reuse the bridge file channel.
+    var sendFile: ((URL) -> Void)?
 
     private struct GalleryRequest {
         let path: String
@@ -199,6 +202,7 @@ struct PhotoGalleryView: View {
 
     private let columns = [GridItem(.adaptive(minimum: 104), spacing: 8)]
     private let accent = Color(red: 0.21, green: 0.39, blue: 0.89)
+    @State private var pickerItems: [PhotosPickerItem] = []
 
     var body: some View {
         NavigationStack {
@@ -227,6 +231,23 @@ struct PhotoGalleryView: View {
             }
             .task { if store.entries.isEmpty { store.refresh() } }
         }
+    }
+
+    private func sendPicked(_ items: [PhotosPickerItem]) async {
+        guard !items.isEmpty else { return }
+        var urls: [URL] = []
+        for item in items {
+            guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
+            let ext = data.starts(with: [0x89, 0x50, 0x4E, 0x47]) ? png
+                : (data.starts(with: [0xFF, 0xD8]) ? jpg : dat)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString + . + ext)
+            guard (try? data.write(to: url)) != nil else { continue }
+            urls.append(url)
+        }
+        pickerItems = []
+        guard !urls.isEmpty else { return }
+        for url in urls { store.sendFile?(url) }
     }
 
     private var albumBar: some View {
