@@ -1066,6 +1066,16 @@ MiniRtcParams MakeParams(const RTCState &state, const std::string &user_id,
   [self sendMessage:bytes reliable:YES stream:kClipboardStream];
 }
 
+- (void)sendPhotoMessage:(NSData *)payload {
+  if (payload.length == 0 || payload.length > 60000) return;
+  dispatch_async(_rtcQueue, ^{
+    if (!self->_state->controller_peer) return;
+    const std::string message(static_cast<const char *>(payload.bytes), payload.length);
+    MiniRtcSendReliableDataFrame(self->_state->controller_peer, message.data(),
+                                 message.size(), kControlStream);
+  });
+}
+
 - (void)sendFileAtURL:(NSURL *)fileURL {
   if (!fileURL.isFileURL) return;
   NSURL *url = [fileURL copy];
@@ -1850,6 +1860,18 @@ MiniRtcParams MakeParams(const RTCState &state, const std::string &user_id,
             self->_state->identity_base, "CrossDesk iOS");
         if (proof && !proof->empty())
           MiniRtcSendReliableDataFrame(self->_state->controller_peer, proof->data(), proof->size(), kControlStream);
+      });
+      return;
+    }
+    // Photo album replies are file_browser JSON (string "type"), which the
+    // numeric RemoteAction parser rejects; forward them verbatim to Swift.
+    if (std::string_view(data, size).find("\"file_browser\"") != std::string_view::npos) {
+      NSData *payload = [NSData dataWithBytes:data length:size];
+      DispatchMain(^{
+        if (![self isControllerGenerationActive:generation]) return;
+        id<CrossDeskRTCBridgeDelegate> delegate = self.delegate;
+        if ([delegate respondsToSelector:@selector(rtcBridge:didReceivePhotoMessage:)])
+          [delegate rtcBridge:self didReceivePhotoMessage:payload];
       });
       return;
     }

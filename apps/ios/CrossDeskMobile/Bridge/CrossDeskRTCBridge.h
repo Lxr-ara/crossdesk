@@ -133,6 +133,8 @@ typedef struct {
 - (void)rtcBridge:(CrossDeskRTCBridge *)bridge
     didSendPrivacyRequest:(uint32_t)requestID success:(BOOL)success;
 - (void)rtcBridge:(CrossDeskRTCBridge *)bridge
+    didReceivePhotoMessage:(NSData *)payload;
+- (void)rtcBridge:(CrossDeskRTCBridge *)bridge
     didUpdateFileTransfer:(NSString *)fileName
                  progress:(double)progress
                   sending:(BOOL)sending;
@@ -202,6 +204,9 @@ typedef struct {
 - (void)setAudioEnabled:(BOOL)enabled;
 - (void)sendClipboardText:(NSString *)text;
 - (void)sendFileAtURL:(NSURL *)fileURL;
+// Photo album RPC (`file_browser` version 1) over the control stream.
+- (void)sendPhotoMessage:(NSData *)payload
+    NS_SWIFT_NAME(sendPhotoMessage(_:));
 - (void)sendSecureAttentionSequence;
 - (void)sendPrivacyCommand:(BOOL)enable
                       lock:(BOOL)lock

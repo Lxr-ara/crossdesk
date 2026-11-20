@@ -59,6 +59,7 @@ struct RemoteSessionView: View {
     @State private var disconnectConfirmationVisible = false
     @State private var cursorPosition: CGPoint?
     @State private var statusMenuVisible = false
+    @State private var showingPhotoGallery = false
     @State private var statusOrbCenter: CGPoint?
     @GestureState private var statusOrbDragTranslation = CGSize.zero
 
@@ -397,6 +398,33 @@ struct RemoteSessionView: View {
         .ignoresSafeArea()
     }
 
+    /// Album entry: a small capsule opposite the status orb so touch targets do
+    /// not overlap the mouse pad or the floating menu.
+    private var photoGalleryLauncher: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Button {
+                    mouseInput.releaseAll()
+                    showingPhotoGallery = true
+                } label: {
+                    Label("照片", systemImage: "photo.on.rectangle.angled")
+                        .font(.footnote.weight(.semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 16)
+                .padding(.bottom, 96)
+                Spacer()
+            }
+        }
+        .sheet(isPresented: $showingPhotoGallery) {
+            PhotoGalleryView(store: session.photoGallery)
+        }
+    }
+
     private var floatingStatusControls: some View {
         // Keep the orb and expanded menu inside the safe area so their initial
         // positions and drag bounds clear the Dynamic Island in either orientation.
@@ -470,6 +498,7 @@ struct RemoteSessionView: View {
                 .frame(width: containerSize.width, height: containerSize.height)
                 .allowsHitTesting(statusMenuVisible)
 
+                photoGalleryLauncher
                 CrossDeskStatusOrb(isExpanded: statusMenuVisible)
                     .frame(width: 54, height: 54)
                     .contentShape(Circle())

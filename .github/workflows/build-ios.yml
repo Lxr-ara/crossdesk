@@ -48,6 +48,9 @@ jobs:
       version: ${{ steps.ios_version.outputs.version }}
     env:
       GITHUB_TOKEN: ${{ github.token }}
+      IOS_CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+      IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+      IOS_PROVISION_BASE64: ${{ secrets.IOS_PROVISION_BASE64 }}
       CROSSDESK_SOURCE_TAG: ${{ inputs.source_tag || '' }}
       IOS_DEPLOYMENT_TARGET: "16.0"
       EXPECTED_IOS_SDK: "26.5"
@@ -360,9 +363,72 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "${PACKAGE_DIR}" "${PACKAGE_FILE}"
           echo "PACKAGE_FILE=${PACKAGE_FILE}" >> "${GITHUB_ENV}"
 
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          APP_PATH="${DERIVED_DATA}/Build/Products/Release-iphoneos/CrossDeskMobile.app"
+          IPA_DIR="${RUNNER_TEMP}/ipa-payload"
+          rm -rf "${IPA_DIR}"
+          mkdir -p "${IPA_DIR}/Payload"
+          cp -R "${APP_PATH}" "${IPA_DIR}/Payload/"
+          IPA_FILE="${GITHUB_WORKSPACE}/CrossDesk-iOS-${VERSION_NUM}-unsigned.ipa"
+          ( cd "${IPA_DIR}" && zip -qry "${IPA_FILE}" Payload )
+          unzip -l "${IPA_FILE}" | head -5
+          echo "UNSIGNED_IPA=${IPA_FILE}" >> "${GITHUB_ENV}"
+
+      - name: Sign IPA with the supplied certificate
+        if: ${{ env.IOS_CERT_P12_BASE64 != '' && env.IOS_PROVISION_BASE64 != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH="${DERIVED_DATA}/Build/Products/Release-iphoneos/CrossDeskMobile.app"
+          echo "${IOS_CERT_P12_BASE64}" | base64 --decode > "${RUNNER_TEMP}/cert.p12"
+          echo "${IOS_PROVISION_BASE64}" | base64 --decode > "${RUNNER_TEMP}/profile.mobileprovision"
+
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import "${RUNNER_TEMP}/cert.p12" -k build.keychain \
+            -P "${IOS_CERT_PASSWORD}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k ci build.keychain >/dev/null
+          IDENTITY="$(security find-identity -v -p codesigning build.keychain \
+            | sed -n 's/.*"\(.*\)"/\1/p' | head -1)"
+          test -n "${IDENTITY}"
+
+          cp "${RUNNER_TEMP}/profile.mobileprovision" "${APP_PATH}/embedded.mobileprovision"
+          security cms -D -i "${RUNNER_TEMP}/profile.mobileprovision" > "${RUNNER_TEMP}/profile.plist"
+          /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "${RUNNER_TEMP}/profile.plist" \
+            > "${RUNNER_TEMP}/entitlements.plist"
+
+          if [ -d "${APP_PATH}/Frameworks" ]; then
+            find "${APP_PATH}/Frameworks" -name "*.framework" -maxdepth 1 -print0 \
+              | xargs -0 -I{} /usr/bin/codesign --force --timestamp=none --sign "${IDENTITY}" "{}"
+          fi
+          /usr/bin/codesign --force --timestamp=none --sign "${IDENTITY}" \
+            --entitlements "${RUNNER_TEMP}/entitlements.plist" "${APP_PATH}"
+
+          IPA_DIR="${RUNNER_TEMP}/ipa-signed"
+          rm -rf "${IPA_DIR}"
+          mkdir -p "${IPA_DIR}/Payload"
+          cp -R "${APP_PATH}" "${IPA_DIR}/Payload/"
+          SIGNED_IPA="${GITHUB_WORKSPACE}/CrossDesk-iOS-${VERSION_NUM}-signed.ipa"
+          ( cd "${IPA_DIR}" && zip -qry "${SIGNED_IPA}" Payload )
+          echo "SIGNED_IPA=${SIGNED_IPA}" >> "${GITHUB_ENV}"
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v6
         with:
           name: crossdesk-ios-arm64-unsigned-${{ env.VERSION_NUM }}
-          path: ${{ env.PACKAGE_FILE }}
+          path: |
+            ${{ env.PACKAGE_FILE }}
+            ${{ env.UNSIGNED_IPA }}
+          if-no-files-found: error
+
+      - name: Upload signed IPA
+        if: ${{ env.SIGNED_IPA != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: crossdesk-ios-arm64-signed-${{ env.VERSION_NUM }}
+          path: ${{ env.SIGNED_IPA }}
           if-no-files-found: error

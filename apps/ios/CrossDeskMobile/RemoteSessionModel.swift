@@ -404,6 +404,8 @@ final class RemoteSessionModel: NSObject, ObservableObject, CrossDeskRTCBridgeDe
         let host: String
         let signalPort: Int
     }
+    /// Controller-side photo album; transport is the control stream.
+    let photoGallery = PhotoGalleryStore()
     private var bridgeConfiguration: BridgeConfiguration?
 
     var pixelBuffer: CVPixelBuffer? { videoFrame?.pixelBuffer }
@@ -421,6 +423,9 @@ final class RemoteSessionModel: NSObject, ObservableObject, CrossDeskRTCBridgeDe
     override init() {
         super.init()
         bridge.delegate = self
+        photoGallery.sendMessage = { [weak self] data in
+            self?.bridge.sendPhotoMessage(data)
+        }
         pictureInPicture.requestFrame = { [weak self] in
             guard let self, self.isConnected else { return }
             self.bridge.requestKeyFrame()
@@ -1170,6 +1175,10 @@ final class RemoteSessionModel: NSObject, ObservableObject, CrossDeskRTCBridgeDe
         bridge.sendPrivacyCommand(enable, lock: lock, blockLocalInput: true, requestID: request)
     }
 
+    func rtcBridge(_ bridge: CrossDeskRTCBridge, didReceivePhotoMessage payload: Data) {
+        photoGallery.receive(payload)
+    }
+
     func rtcBridge(_ bridge: CrossDeskRTCBridge, didReceivePrivacyStatus data: Data) {
         guard isConnected || isConnecting else { return }
         privacyClock = ProcessInfo.processInfo.systemUptime
@@ -1528,6 +1537,13 @@ final class RemoteSessionModel: NSObject, ObservableObject, CrossDeskRTCBridgeDe
         guard hasNetworkConsent, isConnected else { return }
         controlStatus = success ? NSLocalizedString("已发送 Ctrl+Alt+Del", comment: "") : NSLocalizedString("指令发送失败，请重试", comment: "")
         keyboardInputStatus = controlStatus
+    }
+
+    /// The bridge writes incoming files into Documents/Received. Nothing else
+    /// surfaced them to Swift, so the photo album can now count and report them.
+    func rtcBridge(_ bridge: CrossDeskRTCBridge, didReceiveFileAtURL fileURL: URL) {
+        guard hasNetworkConsent, isConnected else { return }
+        photoGallery.handleReceivedFile(fileURL)
     }
 
     func rtcBridge(_ bridge: CrossDeskRTCBridge,
