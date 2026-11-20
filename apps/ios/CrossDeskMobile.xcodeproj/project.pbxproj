@@ -23,7 +23,7 @@
 		100000000000000000000012 /* PrivacyPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000012 /* PrivacyPreferences.swift */; };
 		100000000000000000000013 /* ThumbnailFileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000013 /* ThumbnailFileStore.swift */; };
 		100000000000000000000014 /* PrivacyViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000014 /* PrivacyViews.swift */; };
-		AA11BB22CC33DD44EE55FF67 /* PhotoGallery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000014 /* PhotoGallery.swift */; };
+		AA11BB22CC33DD44EE55FF67 /* PhotoGallery.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11BB22CC33DD44EE55FF66 /* PhotoGallery.swift */; };
 		100000000000000000000015 /* ../../../PRIVACY.md in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000015 /* ../../../PRIVACY.md */; };
 		100000000000000000000016 /* RemoteVideoSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000016 /* RemoteVideoSettings.swift */; };
 		100000000000000000000017 /* RemoteNetworkStatistics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000017 /* RemoteNetworkStatistics.swift */; };
