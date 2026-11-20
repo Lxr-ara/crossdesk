@@ -84,17 +84,18 @@ final class PhotoGalleryStore: ObservableObject {
     func receive(_ data: Data) {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               object["version"] as? Int == 1 else { return }
-        switch object["op"] as? String {
-        case "reply": handleReply(object)
-        case "prepare": answerPrepare(object)
-        case "notice":
+        // Plain comparisons: an optional pattern here would need case "reply"?.
+        let op = object["op"] as? String
+        if op == "reply" {
+            handleReply(object)
+        } else if op == "prepare" {
+            answerPrepare(object)
+        } else if op == "notice" {
             if let ok = object["ok"] as? Bool, ok == false {
                 let reason = (object["error"] as? String) ?? "unknown"
                 errorText = "远端发送失败：\(reason)"
             }
             downloading = false
-        default:
-            break
         }
     }
 
