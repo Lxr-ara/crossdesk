@@ -238,10 +238,10 @@ struct PhotoGalleryView: View {
         var urls: [URL] = []
         for item in items {
             guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
-            let ext = data.starts(with: [0x89, 0x50, 0x4E, 0x47]) ? png
-                : (data.starts(with: [0xFF, 0xD8]) ? jpg : dat)
+            let ext = data.starts(with: [0x89, 0x50, 0x4E, 0x47]) ? "png"
+                : (data.starts(with: [0xFF, 0xD8]) ? "jpg" : "dat")
             let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent(UUID().uuidString + . + ext)
+                .appendingPathComponent(UUID().uuidString + "." + ext)
             guard (try? data.write(to: url)) != nil else { continue }
             urls.append(url)
         }
