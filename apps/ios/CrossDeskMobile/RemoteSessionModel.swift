@@ -427,7 +427,7 @@ final class RemoteSessionModel: NSObject, ObservableObject, CrossDeskRTCBridgeDe
             self?.bridge.sendPhotoMessage(data)
         }
         photoGallery.sendFile = { [weak self] url in
-            self?.bridge.sendFileAtURL(url)
+            self?.bridge.sendFile(at: url)
         }
         pictureInPicture.requestFrame = { [weak self] in
             guard let self, self.isConnected else { return }
