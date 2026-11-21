@@ -140,6 +140,14 @@ typedef struct {
                   sending:(BOOL)sending;
 - (void)rtcBridge:(CrossDeskRTCBridge *)bridge
     didReceiveFileAtURL:(NSURL *)fileURL;
+/// 接收侧精确字节数（传输引擎的 receive 回调）。`sent`/`total` 是引擎已经
+/// 连续落盘的字节数与文件总长度，接收完成时两者相等。发送侧仍然只走
+/// `didUpdateFileTransfer:progress:sending:`。
+- (void)rtcBridge:(CrossDeskRTCBridge *)bridge
+    didReceiveFileProgress:(NSString *)fileName
+                      sent:(uint64_t)sent
+                     total:(uint64_t)total
+                   sending:(BOOL)sending;
 - (void)rtcBridge:(CrossDeskRTCBridge *)bridge
     didUpdateNetworkStats:(CrossDeskNetworkStats)stats
              localDecoder:(NSString *)decoder
@@ -203,7 +211,19 @@ typedef struct {
 - (void)switchToDisplay:(NSInteger)displayIndex;
 - (void)setAudioEnabled:(BOOL)enabled;
 - (void)sendClipboardText:(NSString *)text;
+// 发送入口。引擎接管分块、ACK、限速与暂停；签名保持不变，Swift 无需改动。
 - (void)sendFileAtURL:(NSURL *)fileURL;
+// 跨会话续传的发送入口：`resumeOffset` 是本机认定对端已经拥有的前缀长度，
+// 本次会话的第一块就从该偏移开始发（线格式不变，偏移本来就在块头里）。
+// 返回值只表示请求是否被立刻接受；真正的打开文件失败仍走进度回调（-1）。
+- (BOOL)sendFileAtURL:(NSURL *)fileURL
+         resumeOffset:(uint64_t)resumeOffset
+    NS_SWIFT_NAME(sendFile(at:resumeOffset:));
+// 发送限速（KiB/s，<= 0 表示不限速）与暂停。两者都是会话级设置，重连后按最后
+// 一次设定值恢复。
+- (void)setFileTransferRateKbps:(NSInteger)kbps;
+- (void)setFileTransferPaused:(BOOL)paused;
+- (BOOL)fileTransferPaused;
 // Photo album RPC (`file_browser` version 1) over the control stream.
 - (void)sendPhotoMessage:(NSData *)payload
     NS_SWIFT_NAME(sendPhotoMessage(_:));

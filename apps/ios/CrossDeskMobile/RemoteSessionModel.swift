@@ -355,6 +355,10 @@ final class RemoteSessionModel: NSObject, ObservableObject, CrossDeskRTCBridgeDe
     @Published private(set) var transferStatus = ""
     @Published private(set) var transferProgress = 0.0
     @Published private(set) var receivedFileURL: URL?
+    /// 接收行的进度：字节数来自传输引擎的 receive 回调（发送进度仍走
+    /// transferStatus/transferProgress）。相册/已接收文件界面以后可以直接用。
+    @Published private(set) var fileReceiveStatus = ""
+    @Published private(set) var fileReceiveProgress = 0.0
     @Published private(set) var frameCount: UInt64 = 0
     @Published private(set) var recentConnections = RecentConnectionStore.load()
     @Published private(set) var recentConnectionPresence: [String: Bool] = [:]
@@ -1569,6 +1573,21 @@ final class RemoteSessionModel: NSObject, ObservableObject, CrossDeskRTCBridgeDe
         receivedFileURL = fileURL
         transferStatus = String(format: NSLocalizedString("已接收 %1$@", comment: ""), String(describing: fileURL.lastPathComponent))
         transferProgress = 1
+    }
+
+    /// 接收侧精确字节数（桥里传输引擎的 receive 回调）。只维护接收行的状态，
+    /// 不碰 transferStatus，发送/接收的既有提示仍然由 didUpdateFileTransfer 决定。
+    func rtcBridge(_ bridge: CrossDeskRTCBridge,
+                   didReceiveFileProgress fileName: String,
+                   sent: UInt64,
+                   total: UInt64,
+                   sending: Bool) {
+        guard hasNetworkConsent, isConnected else { return }
+        guard !sending else { return }
+        let fraction = total > 0 ? min(1.0, Double(sent) / Double(total)) : (sent > 0 ? 1.0 : 0.0)
+        fileReceiveProgress = fraction
+        let percent = Int((fraction * 100).rounded())
+        fileReceiveStatus = "\(NSLocalizedString("接收", comment: "")) \(fileName) · \(percent)%"
     }
 
     func rtcBridge(_ bridge: CrossDeskRTCBridge,

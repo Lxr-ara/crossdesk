@@ -3,6 +3,9 @@
 #import <CoreMedia/CoreMedia.h>
 #import <Security/Security.h>
 #import <UIKit/UIKit.h>
+// 引擎泵用 DISPATCH_SOURCE_TYPE_TIMER；显式引 libdispatch，不依赖 Foundation 的
+// 传递包含。
+#import <dispatch/dispatch.h>
 
 #include <algorithm>
 #include <atomic>
@@ -10,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -22,6 +26,11 @@
 #include <file_transfer_format.h>
 #include <remote_action.h>
 #include <stream_names.h>
+// 共享传输引擎：分块、反馈 ACK、限速、暂停、跨会话续传的发送起点、接收侧
+// 暂存与发布全部由它负责，iOS 适配层只提供三条回调和自己的目录。
+// 注意：iOS 目标的 HEADER_SEARCH_PATHS 必须包含 libs/controller/include，
+// 引擎自己 include 的 <file_transfer_resume.h> 也在这个目录里。
+#include <file_transfer_core.h>
 #include "minirtc.h"
 #include "../../../../libs/controller/include/mobile_device_trust.h"
 
@@ -30,34 +39,25 @@ namespace {
 using crossdesk::mobile_controller::DeviceTrustIdentity;
 
 using crossdesk::ControlType;
-using crossdesk::FileTransferAck;
 using crossdesk::KeyFlag;
 using crossdesk::MouseFlag;
 using crossdesk::RemoteAction;
 using crossdesk::ServiceCommandFlag;
-using crossdesk::kFileAckMagic;
 using crossdesk::kAudioStream;
 using crossdesk::kClipboardStream;
 using crossdesk::kControlStream;
 using crossdesk::kDataStream;
-using crossdesk::kFileChunkSize;
 using crossdesk::kFileFeedbackStream;
 using crossdesk::kFileStream;
 using crossdesk::kKeyboardStream;
 using crossdesk::kMaxClipboardBytes;
 using crossdesk::kMouseStream;
 
-struct IncomingFile {
-  std::string name;
-  std::string path;
-  uint64_t total_size = 0;
-  uint64_t received = 0;
-  FILE *handle = nullptr;
-};
-
-struct OutgoingFile {
-  std::string name;
-  uint64_t total_size = 0;
+// 引擎回调（发送 / 文件进度 / 接收进度）比任何一次调用活得久，lambda 里只持
+// 弱引用：Session 由桥持有，强引用会形成 Session -> lambda -> 桥 的保留环，
+// dealloc 永远不会跑。
+struct BridgeWeakRef {
+  __weak CrossDeskRTCBridge *owner = nil;
 };
 
 enum class PeerRole { Identity, Controller };
@@ -95,12 +95,12 @@ struct RTCState {
   std::string pending_password;
   std::string transmission_id;
   std::string log_path;
-  std::unordered_map<uint32_t, IncomingFile> incoming_files;
-  std::unordered_map<uint32_t, OutgoingFile> outgoing_files;
 };
 
-std::atomic<uint32_t> g_next_file_id{1};
 char kRTCQueueSpecificKey;
+// 引擎泵的节拍：5 ms 一拍，1 ms leeway 允许系统把附近的唤醒合并起来。
+constexpr uint64_t kFilePumpIntervalNanoseconds = 5ull * 1000ull * 1000ull;
+constexpr uint64_t kFilePumpLeewayNanoseconds = 1000ull * 1000ull;
 
 bool IsReusableIdentity(const std::string &identity) {
   const size_t separator = identity.find('@');
@@ -393,6 +393,16 @@ void DispatchMain(dispatch_block_t block) {
 - (void)destroyIdentityPeer;
 - (void)reportIdentityStorageStatus:(OSStatus)status;
 - (void)destroyControllerPeer;
+- (void)createTransferSession;
+- (void)destroyTransferSession;
+- (void)startFilePump;
+- (void)wakeFilePump;
+- (void)reportFileTransfer:(NSString *)fileName
+                  progress:(double)progress
+                   sending:(BOOL)sending
+                generation:(uint64_t)generation;
+- (void)reportReceivedFileAt:(NSString *)path
+                  generation:(uint64_t)generation;
 @end
 
 namespace {
@@ -533,7 +543,18 @@ MiniRtcParams MakeParams(const RTCState &state, const std::string &user_id,
   NSTimeInterval _pendingVideoCaptureUptime;
   bool _videoDeliveryScheduled;
   uint64_t _videoDeliveryGeneration;
-  std::mutex _fileMutex;
+  // 共享传输引擎（libs/controller/include/file_transfer_core.h）。与
+  // controller_peer 同生共死：createControllerPeer 里创建，destroyControllerPeer
+  // 里 Cancel + 释放。所有调用都在 _rtcQueue 上，因此桥内不再需要 _fileMutex
+  // 保护的句柄表和分段表。
+  std::shared_ptr<crossdesk::file_transfer::Session> _transfer;
+  // 引擎泵（dispatch source，跑在 _rtcQueue 上）。限速与暂停的原子量是 UI
+  // 线程唯一读取的来源，Session 只在 _rtcQueue 上被摸，重连后按这里的值恢复。
+  dispatch_source_t _filePumpTimer;
+  std::atomic<uint64_t> _fileSendRateBytesPerSecond;
+  std::atomic<bool> _fileSendPaused;
+  // picker 给的 security-scoped URL 只保留到本次发送的终态，之后立刻放手。
+  NSURL *_sendScopedURL;
   std::atomic<int> _selectedDisplay;
   std::atomic<uint64_t> _receivedVideoFrames;
   std::atomic<uint64_t> _controllerGenerationCounter;
@@ -584,6 +605,10 @@ MiniRtcParams MakeParams(const RTCState &state, const std::string &user_id,
     _pendingVideoCaptureUptime = 0;
     _videoDeliveryScheduled = false;
     _videoDeliveryGeneration = 0;
+    _filePumpTimer = nil;
+    _sendScopedURL = nil;
+    _fileSendRateBytesPerSecond.store(0);
+    _fileSendPaused.store(false);
     _selectedDisplay.store(0);
     _receivedVideoFrames.store(0);
     _controllerGenerationCounter.store(0);
@@ -1076,101 +1101,269 @@ MiniRtcParams MakeParams(const RTCState &state, const std::string &user_id,
   });
 }
 
-- (void)sendFileAtURL:(NSURL *)fileURL {
-  if (!fileURL.isFileURL) return;
-  NSURL *url = [fileURL copy];
-  NSString *fileName = url.lastPathComponent.length > 0 ? url.lastPathComponent : @"file";
-  const uint64_t generation = _activeControllerGeneration.load();
-  void (^reportProgress)(double) = ^(double progress) {
+// 共享传输引擎的构造点。与 controller_peer 同一处创建（createControllerPeer）、
+// 同一处销毁（destroyControllerPeer）。限速、暂停、续传起点、暂存与发布都在
+// libs/controller/include/file_transfer_core.h 里，桥内不再有文件句柄表、
+// 分段表和自己拼的反馈 ACK。
+- (void)createTransferSession {
+  if (_transfer) return;
+  NSURL *documents = [[NSFileManager defaultManager]
+      URLsForDirectory:NSDocumentDirectory
+             inDomains:NSUserDomainMask].firstObject;
+  if (!documents) return;
+  // 与旧实现同一个落点：Documents/Received。receive_subdirectory 关掉，引擎
+  // 就平铺发布（同名冲突时用硬链接换一个带时间戳的名字，绝不覆盖别人的文件）。
+  NSURL *directory = [documents URLByAppendingPathComponent:@"Received"
+                                                isDirectory:YES];
+  if (!directory) return;
+  [[NSFileManager defaultManager] createDirectoryAtURL:directory
+                           withIntermediateDirectories:YES
+                                            attributes:nil
+                                                 error:nil];
+  const char *directory_path = directory.path.fileSystemRepresentation;
+  if (!directory_path) return;
+
+  BridgeWeakRef weak_ref;
+  weak_ref.owner = self;
+  // 会话与这次连接同代：所有通知都按创建时的 generation 过滤，绝不串到下一次
+  // 连接上（destroyControllerPeer 先清 active generation，所以拆链之后一律丢弃）。
+  const uint64_t session_generation = _activeControllerGeneration.load();
+
+  // 引擎自己给每条帧挑流名：数据块 kFileStream，反馈 kFileFeedbackStream。
+  // 返回 0 表示已交给传输层；非 0 会让引擎按发送失败收尾。
+  auto send = [weak_ref](const char *stream, const char *data, size_t size) -> int {
+    CrossDeskRTCBridge *owner = weak_ref.owner;
+    if (!owner || !owner->_state->controller_peer) return -1;
+    return MiniRtcSendReliableDataFrame(owner->_state->controller_peer, data,
+                                        size, stream ? stream : kFileStream);
+  };
+
+  // 文件级进度：-1 失败，0..1 正常，发送侧 sending == true，语义与旧实现一致。
+  auto progress = [weak_ref, session_generation](const std::string &name, double value,
+                                                 bool sending, const std::string &path) {
+    CrossDeskRTCBridge *owner = weak_ref.owner;
+    if (!owner) return;
+    NSString *fileName = name.empty() ? @"file"
+        : [[NSString alloc] initWithBytes:name.data()
+                                   length:name.size()
+                                 encoding:NSUTF8StringEncoding];
+    fileName = fileName ?: @"file";
+    if (!sending && !path.empty()) {
+      // 发布完成：引擎只在这里给出最终落盘路径（ReceiveState 里只有名字），
+      // 也正是每份接收文件唯一的一次完成通知。
+      NSString *published = [[NSString alloc] initWithBytes:path.data()
+                                                     length:path.size()
+                                                   encoding:NSUTF8StringEncoding];
+      [owner reportFileTransfer:fileName progress:1 sending:NO
+                     generation:session_generation];
+      [owner reportReceivedFileAt:published generation:session_generation];
+      return;
+    }
+    if (sending && (value < 0 || value >= 1) && owner->_sendScopedURL) {
+      // 发送终态：picker 的 sandbox extension 到这里才放手。
+      [owner->_sendScopedURL stopAccessingSecurityScopedResource];
+      owner->_sendScopedURL = nil;
+    }
+    [owner reportFileTransfer:fileName progress:value sending:sending
+                   generation:session_generation];
+  };
+
+  // 接收侧精确字节数，给 Swift 画接收行用；回收阶段（失败/取消）也走这里。
+  auto receive_progress =
+      [weak_ref, session_generation](const crossdesk::file_transfer::ReceiveState &state) {
+    CrossDeskRTCBridge *owner = weak_ref.owner;
+    if (!owner) return;
+    NSString *fileName = state.name.empty() ? @"file"
+        : [[NSString alloc] initWithBytes:state.name.data()
+                                   length:state.name.size()
+                                 encoding:NSUTF8StringEncoding];
+    fileName = fileName ?: @"file";
+    const uint64_t sent = state.received;
+    const uint64_t total = state.total;
     DispatchMain(^{
-      if (![self isControllerGenerationActive:generation]) return;
-      id<CrossDeskRTCBridgeDelegate> delegate = self.delegate;
-      if ([delegate respondsToSelector:@selector(rtcBridge:didUpdateFileTransfer:progress:sending:)]) {
-        [delegate rtcBridge:self didUpdateFileTransfer:fileName progress:progress sending:YES];
+      if (![owner isControllerGenerationActive:session_generation]) return;
+      id<CrossDeskRTCBridgeDelegate> delegate = owner.delegate;
+      if ([delegate respondsToSelector:
+              @selector(rtcBridge:didReceiveFileProgress:sent:total:sending:)]) {
+        [delegate rtcBridge:owner
+            didReceiveFileProgress:fileName
+                              sent:sent
+                             total:total
+                           sending:NO];
       }
     });
   };
+
+  crossdesk::file_transfer::Options options;
+  options.receive_subdirectory = false;  // 平铺发布到 Documents/Received
+  options.send_rate_bytes_per_second = _fileSendRateBytesPerSecond.load();
+  auto transfer = std::make_shared<crossdesk::file_transfer::Session>(
+      send, progress, options, receive_progress);
+  transfer->SetDirectory(std::filesystem::path(directory_path));
+  transfer->SetSendPaused(_fileSendPaused.load());
+  _transfer = std::move(transfer);
+  [self startFilePump];
+}
+
+// 泵先停，再关会话（引擎在这里清掉未完成的暂存，并把会话标成 closed，迟到的
+// 数据回调一律被忽略），最后释放 shared_ptr。全部发生在 _rtcQueue 上。
+- (void)destroyTransferSession {
+  if (_filePumpTimer) {
+    dispatch_source_cancel(_filePumpTimer);
+    _filePumpTimer = nil;
+  }
+  if (_sendScopedURL) {
+    [_sendScopedURL stopAccessingSecurityScopedResource];
+    _sendScopedURL = nil;
+  }
+  if (!_transfer) return;
+  _transfer->Cancel();
+  _transfer.reset();
+}
+
+// 引擎的节拍：dispatch source 跑在 _rtcQueue 上，5 ms 一拍。
+- (void)startFilePump {
+  if (_filePumpTimer) return;
+  dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                   _rtcQueue);
+  if (!timer) return;
+  __weak CrossDeskRTCBridge *weakSelf = self;
+  dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, kFilePumpIntervalNanoseconds,
+                            kFilePumpLeewayNanoseconds);
+  dispatch_source_set_event_handler(timer, ^{
+    CrossDeskRTCBridge *owner = weakSelf;
+    if (!owner) return;
+    // 同一个串行队列上，_transfer 不会被换掉；拷一份 shared_ptr 保证这次调用
+    // 期间对象不会被释放。一次 Pump 最多发一块（限速与暂停由引擎自己判）。
+    auto transfer = owner->_transfer;
+    if (!transfer) return;
+    transfer->Pump();
+  });
+  _filePumpTimer = timer;
+  dispatch_resume(timer);
+}
+
+// Start / Ack / Receive 之后立刻跑一拍，并把 5 ms 的间隔重新锚到当前时刻，
+// 传输不需要等下一个 tick。
+- (void)wakeFilePump {
+  auto transfer = _transfer;
+  if (!transfer) return;
+  transfer->Pump();
+  if (_filePumpTimer) {
+    dispatch_source_set_timer(_filePumpTimer, DISPATCH_TIME_NOW,
+                              kFilePumpIntervalNanoseconds,
+                              kFilePumpLeewayNanoseconds);
+  }
+}
+
+// 所有 didUpdateFileTransfer 通知都从这里出去：-1 失败，0..1 正常。
+- (void)reportFileTransfer:(NSString *)fileName
+                  progress:(double)progress
+                   sending:(BOOL)sending
+                generation:(uint64_t)generation {
+  NSString *name = fileName.length > 0 ? fileName : @"file";
+  DispatchMain(^{
+    if (![self isControllerGenerationActive:generation]) return;
+    id<CrossDeskRTCBridgeDelegate> delegate = self.delegate;
+    if ([delegate respondsToSelector:
+            @selector(rtcBridge:didUpdateFileTransfer:progress:sending:)]) {
+      [delegate rtcBridge:self
+          didUpdateFileTransfer:name
+                       progress:progress
+                        sending:sending];
+    }
+  });
+}
+
+// 每份接收完成文件唯一的一次 didReceiveFileAtURL 通知。
+- (void)reportReceivedFileAt:(NSString *)path generation:(uint64_t)generation {
+  if (path.length == 0) return;
+  NSURL *fileURL = [NSURL fileURLWithPath:path];
+  if (!fileURL) return;
+  DispatchMain(^{
+    if (![self isControllerGenerationActive:generation]) return;
+    id<CrossDeskRTCBridgeDelegate> delegate = self.delegate;
+    if ([delegate respondsToSelector:@selector(rtcBridge:didReceiveFileAtURL:)]) {
+      [delegate rtcBridge:self didReceiveFileAtURL:fileURL];
+    }
+  });
+}
+
+- (void)setFileTransferRateKbps:(NSInteger)kbps {
+  // <= 0 就是不限速（引擎里 0 表示走传输层速度）。设定值先落原子量，重连后
+  // 由 createTransferSession 恢复。
+  const uint64_t bytes_per_second =
+      kbps <= 0 ? 0 : static_cast<uint64_t>(kbps) * 1024;
+  _fileSendRateBytesPerSecond.store(bytes_per_second);
+  dispatch_async(_rtcQueue, ^{
+    auto transfer = self->_transfer;
+    if (transfer) transfer->SetSendRate(bytes_per_second);
+  });
+}
+
+- (void)setFileTransferPaused:(BOOL)paused {
+  _fileSendPaused.store(paused != NO);
+  dispatch_async(_rtcQueue, ^{
+    auto transfer = self->_transfer;
+    if (transfer) transfer->SetSendPaused(paused);
+  });
+}
+
+- (BOOL)fileTransferPaused {
+  return _fileSendPaused.load();
+}
+
+- (void)sendFileAtURL:(NSURL *)fileURL {
+  [self sendFileAtURL:fileURL resumeOffset:0];
+}
+
+// 返回值只说明请求是否被立刻接受（URL/文件名当场可判定的失败返回 NO）；打开
+// 文件的失败由引擎报告，走同一条进度回调（-1）。
+- (BOOL)sendFileAtURL:(NSURL *)fileURL resumeOffset:(uint64_t)resumeOffset {
+  if (!fileURL.isFileURL) return NO;
+  NSURL *url = [fileURL copy];
+  NSString *fileName = url.lastPathComponent.length > 0 ? url.lastPathComponent : @"file";
+  NSData *name_data = [fileName dataUsingEncoding:NSUTF8StringEncoding];
+  if (name_data.length == 0 ||
+      name_data.length > std::numeric_limits<uint16_t>::max()) {
+    return NO;
+  }
+  const char *path_bytes = url.path.fileSystemRepresentation;
+  if (!path_bytes) return NO;
+  const std::string path(path_bytes);
+  const std::string name(static_cast<const char *>(name_data.bytes), name_data.length);
+  const uint64_t generation = _activeControllerGeneration.load();
   // Acquire the document picker's sandbox extension before its completion
-  // callback returns; the actual reads happen on the serialized RTC queue.
+  // callback returns; 读盘、限速和 ACK 都在串行的 RTC 队列上由引擎完成。
   const BOOL scoped = [url startAccessingSecurityScopedResource];
   dispatch_async(_rtcQueue, ^{
-    FILE *input = nullptr;
-    const auto finish = [&](bool failed) {
-      if (input) std::fclose(input);
-      if (scoped) [url stopAccessingSecurityScopedResource];
-      if (failed) reportProgress(-1);
-    };
-    if (![self isControllerGenerationActive:generation] || !self->_state->controller_peer) {
-      finish(false);
-      return;
+    BOOL started = NO;
+    if ([self isControllerGenerationActive:generation] && self->_transfer &&
+        self->_state->controller_peer) {
+      // total_size 传 0 表示「按本地文件大小决定」，所以 resumeOffset 0 就是普通
+      // 发送；resumeOffset > 0 时引擎会先校验本地文件真有那么多字节再 seek。
+      started = self->_transfer->Start(
+          path, name, 0, crossdesk::file_transfer::Session::Clock::now(), 0,
+          resumeOffset);
     }
-    const char *path_bytes = url.path.fileSystemRepresentation;
-    input = path_bytes ? std::fopen(path_bytes, "rb") : nullptr;
-    if (!input || fseeko(input, 0, SEEK_END) != 0) {
-      finish(true);
-      return;
-    }
-    const off_t end = ftello(input);
-    if (end < 0 || fseeko(input, 0, SEEK_SET) != 0) {
-      finish(true);
-      return;
-    }
-    NSData *name_data = [fileName dataUsingEncoding:NSUTF8StringEncoding];
-    if (name_data.length == 0 ||
-        name_data.length > std::numeric_limits<uint16_t>::max()) {
-      finish(true);
-      return;
-    }
-
-    const std::string file_name(static_cast<const char *>(name_data.bytes), name_data.length);
-    const uint32_t file_id = g_next_file_id.fetch_add(1);
-    const uint64_t total_size = static_cast<uint64_t>(end);
-    {
-      std::lock_guard<std::mutex> lock(self->_fileMutex);
-      self->_state->outgoing_files[file_id] = {file_name, total_size};
-    }
-    reportProgress(0);
-
-    std::vector<char> payload(kFileChunkSize);
-    uint64_t offset = 0;
-    bool first = true;
-    int send_result = 0;
-    do {
-      if (![self isControllerGenerationActive:generation]) { send_result = -1; break; }
-      const size_t to_read = static_cast<size_t>(
-          std::min<uint64_t>(kFileChunkSize, total_size - offset));
-      const size_t bytes_read = to_read > 0
-          ? std::fread(payload.data(), 1, to_read, input)
-          : 0;
-      // A short read indicates EOF or an error. Stop before sending a partial
-      // chunk or reading again from a stream whose position may be invalid.
-      if (bytes_read != to_read) {
-        send_result = -1;
-        break;
+    if (started) {
+      // 引擎从现在起只从已打开的文件流读，extension 保留到这次发送的终态。
+      if (scoped) {
+        if (self->_sendScopedURL) {
+          [self->_sendScopedURL stopAccessingSecurityScopedResource];
+        }
+        self->_sendScopedURL = url;
       }
-      const bool last = offset + bytes_read >= total_size;
-      const std::string* file_name_pointer = first ? &file_name : nullptr;
-      std::vector<char> chunk = crossdesk::EncodeFileChunk(
-          file_id, offset, total_size, payload.data(),
-          static_cast<uint32_t>(bytes_read), file_name_pointer, first, last);
-      if (chunk.empty()) {
-        send_result = -1;
-        break;
-      }
-      send_result = MiniRtcSendReliableDataFrame(self->_state->controller_peer,
-                                          chunk.data(), chunk.size(),
-                                          kFileStream);
-      offset += bytes_read;
-      first = false;
-      if (send_result != 0) break;
-    } while (offset < total_size);
-
-    if (send_result != 0) {
-      std::lock_guard<std::mutex> lock(self->_fileMutex);
-      self->_state->outgoing_files.erase(file_id);
+      [self wakeFilePump];
+      return;
     }
-    finish(send_result != 0);
+    if (scoped) [url stopAccessingSecurityScopedResource];
+    [self reportFileTransfer:[NSString stringWithUTF8String:name.c_str()]
+                    progress:-1
+                     sending:YES
+                  generation:generation];
   });
+  return YES;
 }
 
 - (void)sendPrivacyCommand:(BOOL)enable
@@ -1302,6 +1495,10 @@ MiniRtcParams MakeParams(const RTCState &state, const std::string &user_id,
   MiniRtcAddDataStream(_state->controller_peer, kFileFeedbackStream, true);
   MiniRtcAddDataStream(_state->controller_peer, kClipboardStream, true);
 
+  // 引擎必须在流注册之后创建：它的 send 回调立刻就能把块和反馈发到这两条
+  // 已注册的流上。MiniRtcInit 失败时 destroyControllerPeer 会把它关掉。
+  [self createTransferSession];
+
   if (MiniRtcInit(_state->controller_peer) != 0) {
     [self destroyControllerPeer];
     [self handleConnectionState:CrossDeskConnectionStateFailed
@@ -1330,6 +1527,9 @@ MiniRtcParams MakeParams(const RTCState &state, const std::string &user_id,
 
 - (void)destroyControllerPeer {
   _activeControllerGeneration.store(0);
+  // 顺序要紧：先停泵，再让引擎关会话（清暂存、标 closed，迟到的回调一律丢弃），
+  // 最后才拆 peer —— 引擎的 send 回调仍然引用 controller_peer。
+  [self destroyTransferSession];
   if (_state->controller_peer) {
     if (!_state->transmission_id.empty()) {
       MiniRtcLeaveConnection(_state->controller_peer,
@@ -1339,14 +1539,6 @@ MiniRtcParams MakeParams(const RTCState &state, const std::string &user_id,
   }
   _state->controller_login.clear();
   _state->transmission_id.clear();
-  {
-    std::lock_guard<std::mutex> lock(_fileMutex);
-    for (auto &entry : _state->incoming_files) {
-      if (entry.second.handle) std::fclose(entry.second.handle);
-    }
-    _state->incoming_files.clear();
-    _state->outgoing_files.clear();
-  }
   _selectedDisplay.store(0);
   _receivedVideoFrames.store(0);
   [self resetVideoDelivery];
@@ -2032,168 +2224,26 @@ MiniRtcParams MakeParams(const RTCState &state, const std::string &user_id,
   }
 
   if (source == kFileFeedbackStream) {
-    FileTransferAck ack{};
-    if (!crossdesk::DecodeFileTransferAck(data, size, &ack)) return;
-
-    NSString *name = nil;
-    double progress = 0;
-    {
-      std::lock_guard<std::mutex> lock(_fileMutex);
-      auto it = _state->outgoing_files.find(ack.file_id);
-      if (it == _state->outgoing_files.end()) return;
-      if (ack.total_size != it->second.total_size) return;
-      name = [NSString stringWithUTF8String:it->second.name.c_str()];
-      progress = ack.total_size == 0
-          ? 1
-          : std::clamp(static_cast<double>(ack.acked_offset) /
-                           static_cast<double>(ack.total_size),
-                       0.0, 1.0);
-      if ((ack.flags & 0x03) != 0) {
-        if ((ack.flags & 0x02) != 0) progress = -1;
-        _state->outgoing_files.erase(it);
-      }
-    }
-    DispatchMain(^{
-      if (![self isControllerGenerationActive:generation]) return;
-      id<CrossDeskRTCBridgeDelegate> delegate = self.delegate;
-      if ([delegate respondsToSelector:
-              @selector(rtcBridge:didUpdateFileTransfer:progress:sending:)]) {
-        [delegate rtcBridge:self
-            didUpdateFileTransfer:name ?: @"file"
-                         progress:progress
-                          sending:YES];
-      }
+    // 反馈帧的唯一消费者是引擎：偏移校验、终态判定、进度和收尾都归它，桥内
+    // 不再维护 outgoing_files。发送已经在这条串行队列上，投递即可。
+    const std::string acknowledgement(data, size);
+    dispatch_async(_rtcQueue, ^{
+      if (![self isControllerGenerationActive:generation] || !self->_transfer) return;
+      self->_transfer->Ack(acknowledgement.data(), acknowledgement.size());
+      [self wakeFilePump];
     });
     return;
   }
 
   if (source != kFileStream) return;
-  crossdesk::FileChunkView chunk;
-  if (!crossdesk::DecodeFileChunk(data, size, &chunk)) return;
-  const crossdesk::FileChunkHeader& header = chunk.header;
-
-  NSURL *completed_url = nil;
-  NSString *progress_name = nil;
-  double progress = 0;
-  FileTransferAck ack{};
-  ack.magic = kFileAckMagic;
-  ack.file_id = header.file_id;
-  ack.acked_offset = header.offset;
-  ack.total_size = header.total_size;
-
-  {
-    std::lock_guard<std::mutex> lock(_fileMutex);
-    auto it = _state->incoming_files.find(header.file_id);
-    if (it == _state->incoming_files.end()) {
-      if ((header.flags & 0x01) == 0) return;
-      NSString *raw_name = !chunk.file_name.empty()
-          ? [[NSString alloc] initWithBytes:chunk.file_name.data()
-                                     length:chunk.file_name.size()
-                                   encoding:NSUTF8StringEncoding]
-          : nil;
-      NSString *safe_name = raw_name.lastPathComponent;
-      safe_name = [safe_name stringByReplacingOccurrencesOfString:@"\\"
-                                                        withString:@"_"];
-      safe_name = [safe_name stringByReplacingOccurrencesOfString:@":"
-                                                        withString:@"_"];
-      if (safe_name.length == 0 || [safe_name isEqualToString:@"."] ||
-          [safe_name isEqualToString:@".."]) {
-        safe_name = [NSString stringWithFormat:@"received_%u", header.file_id];
-      }
-
-      NSURL *documents = [[NSFileManager defaultManager]
-          URLsForDirectory:NSDocumentDirectory
-                 inDomains:NSUserDomainMask].firstObject;
-      NSURL *directory = [documents URLByAppendingPathComponent:@"Received"
-                                                    isDirectory:YES];
-      [[NSFileManager defaultManager] createDirectoryAtURL:directory
-                               withIntermediateDirectories:YES
-                                                attributes:nil
-                                                     error:nil];
-      NSURL *target = [directory URLByAppendingPathComponent:safe_name];
-      if ([[NSFileManager defaultManager] fileExistsAtPath:target.path]) {
-        NSString *stem = safe_name.stringByDeletingPathExtension;
-        NSString *extension = safe_name.pathExtension;
-        NSString *unique = extension.length > 0
-            ? [NSString stringWithFormat:@"%@_%u.%@", stem, header.file_id,
-                                         extension]
-            : [NSString stringWithFormat:@"%@_%u", stem, header.file_id];
-        target = [directory URLByAppendingPathComponent:unique];
-        safe_name = unique;
-      }
-
-      FILE *output = std::fopen(target.path.fileSystemRepresentation, "wb+");
-      if (!output) return;
-      IncomingFile incoming;
-      incoming.name = safe_name.UTF8String ?: "file";
-      incoming.path = target.path.fileSystemRepresentation ?: "";
-      incoming.total_size = header.total_size;
-      incoming.handle = output;
-      _state->incoming_files.emplace(header.file_id, std::move(incoming));
-      it = _state->incoming_files.find(header.file_id);
-    }
-
-    IncomingFile &incoming = it->second;
-    bool write_ok = incoming.total_size == header.total_size &&
-                    fseeko(incoming.handle, static_cast<off_t>(header.offset),
-                           SEEK_SET) == 0;
-    if (write_ok && chunk.payload_size > 0) {
-      write_ok = std::fwrite(chunk.payload, 1, chunk.payload_size,
-                             incoming.handle) == chunk.payload_size;
-    }
-    if (!write_ok) {
-      ack.flags |= 0x02;
-      std::fclose(incoming.handle);
-      _state->incoming_files.erase(it);
-    } else {
-      ack.acked_offset = header.offset + chunk.payload_size;
-      incoming.received = std::max(incoming.received, ack.acked_offset);
-      progress_name = [NSString stringWithUTF8String:incoming.name.c_str()];
-      progress = incoming.total_size == 0
-          ? 1
-          : std::clamp(static_cast<double>(incoming.received) /
-                           static_cast<double>(incoming.total_size),
-                       0.0, 1.0);
-      const bool completed = (header.flags & 0x02) != 0 ||
-                             incoming.received >= incoming.total_size;
-      if (completed) {
-        ack.flags |= 0x01;
-        std::fflush(incoming.handle);
-        std::fclose(incoming.handle);
-        completed_url = [NSURL fileURLWithPath:
-            [NSString stringWithUTF8String:incoming.path.c_str()]];
-        _state->incoming_files.erase(it);
-      }
-    }
-  }
-
+  // 数据块同样整块交给引擎：暂存目录、范围合并、反馈 ACK 和最终发布都在
+  // _rtcQueue 上完成，随后的 Pump 把下一块或本段的 ACK 推进下去。
+  const std::string chunk_bytes(data, size);
   dispatch_async(_rtcQueue, ^{
-    if ([self isControllerGenerationActive:generation] && self->_state->controller_peer) {
-      const auto encoded_ack =
-          crossdesk::EncodeFileTransferAck(ack);
-      MiniRtcSendReliableDataFrame(self->_state->controller_peer,
-                            encoded_ack.data(), encoded_ack.size(),
-                            kFileFeedbackStream);
-    }
+    if (![self isControllerGenerationActive:generation] || !self->_transfer) return;
+    self->_transfer->Receive(chunk_bytes.data(), chunk_bytes.size());
+    [self wakeFilePump];
   });
-  if (progress_name) {
-    DispatchMain(^{
-      if (![self isControllerGenerationActive:generation]) return;
-      id<CrossDeskRTCBridgeDelegate> delegate = self.delegate;
-      if ([delegate respondsToSelector:
-              @selector(rtcBridge:didUpdateFileTransfer:progress:sending:)]) {
-        [delegate rtcBridge:self
-            didUpdateFileTransfer:progress_name
-                         progress:progress
-                          sending:NO];
-      }
-      if (completed_url &&
-          [delegate respondsToSelector:
-              @selector(rtcBridge:didReceiveFileAtURL:)]) {
-        [delegate rtcBridge:self didReceiveFileAtURL:completed_url];
-      }
-    });
-  }
 }
 
 - (void)handleStats:(const MiniRtcNetTrafficStats *)stats
